@@ -174,12 +174,22 @@ class AnalizadorSintactico:
     def analizar(self):
         """Punto de entrada: analiza el programa completo."""
         raiz = NodoAST('Module')
+        intentos_sin_avance = 0
         while self.pos < len(self.tokens):
+            pos_antes = self.pos
             nodo = self.parsear_sentencia()
             if nodo:
                 raiz.agregar_hijo(nodo)
-            elif self.pos < len(self.tokens):
-                self.pos += 1  # Evitar bucle infinito
+            # Si la posicion no avanzo nada (ni parsear_sentencia ni nadie movio pos)
+            # forzamos avance para evitar bucle infinito garantizado
+            if self.pos == pos_antes:
+                self.pos += 1
+                intentos_sin_avance += 1
+            else:
+                intentos_sin_avance = 0
+            # Seguro extra: si llevamos demasiados saltos forzados seguidos, salir
+            if intentos_sin_avance > 20:
+                break
         return raiz
 
     def parsear_sentencia(self):
@@ -390,67 +400,154 @@ class AnalizadorSintactico:
 
     def parsear_primario(self):
         """
-        Parsea unidades basicas:
-        - Numeros, cadenas, booleanos
-        - Identificadores y llamadas a funcion
-        - Expresiones entre parentesis
+        Parsea unidades basicas.
+        Cubre todos los tipos de tokens que pueden aparecer en expresiones,
+        incluyendo los nuevos: hex, cientifico, cadenas triples, accesos
+        encadenados (obj.met1().met2()), indexacion (arr[i]), etc.
         """
         t = self.token_actual()
         if t is None:
-            return NodoAST('?')
+            return NodoAST('EOF')
 
-        if t.tipo in ('NUMERO_INT', 'NUMERO_FLOAT'):
+        # ── Todos los tipos de numeros ─────────────────────────────────────────
+        if t.tipo in ('NUMERO_INT', 'NUMERO_FLOAT', 'NUMERO_CIENTIFICO',
+                      'NUMERO_HEX', 'NUMERO_HEX_ASM', 'NUMERO_OCTAL',
+                      'NUMERO_BINARIO'):
             self.avanzar()
             return NodoAST(t.valor)
 
-        if t.tipo in ('CADENA', 'CADENA_SIMPLE'):
+        # ── Todos los tipos de cadenas ─────────────────────────────────────────
+        if t.tipo in ('CADENA', 'CADENA_SIMPLE',
+                      'CADENA_TRIPLE_DOBLE', 'CADENA_TRIPLE_SIMPLE'):
             self.avanzar()
             return NodoAST(t.valor)
 
-        if t.tipo in ('PR_TRUE', 'PR_FALSE', 'PR_NONE'):
+        # ── Literales booleanos y nulos ────────────────────────────────────────
+        if t.tipo in ('PR_TRUE', 'PR_FALSE', 'PR_NONE',
+                      'PR_TRUE_C', 'PR_FALSE_C', 'PR_NULL', 'PR_NULL_JS',
+                      'PR_UNDEFINED'):
             self.avanzar()
             return NodoAST(t.valor)
 
+        # ── Identificador: variable, llamada, acceso encadenado ───────────────
         if t.tipo == 'IDENTIFICADOR':
             self.avanzar()
-            if self.es_tipo('PAREN_ABRE'):
-                return self.parsear_llamada(t.valor)
-            if self.es_tipo('PUNTO'):
-                self.avanzar()
-                nodo_p = NodoAST('.')
-                nodo_p.agregar_hijo(NodoAST(t.valor))
-                if self.es_tipo('IDENTIFICADOR'):
-                    attr = self.avanzar()
-                    if self.es_tipo('PAREN_ABRE'):
-                        nodo_p.agregar_hijo(self.parsear_llamada(attr.valor))
-                    else:
-                        nodo_p.agregar_hijo(NodoAST(attr.valor))
-                return nodo_p
-            return NodoAST(t.valor)
+            nodo = NodoAST(t.valor)
 
+            # Loop para manejar cadenas: obj.met(args)[idx].otro(args)...
+            while self.token_actual() is not None:
+                # Llamada a funcion: nombre(args)
+                if self.es_tipo('PAREN_ABRE'):
+                    nodo = self._parsear_llamada_nodo(nodo)
+
+                # Acceso a atributo: objeto.atributo
+                elif self.es_tipo('PUNTO'):
+                    self.avanzar()  # Consume '.'
+                    if self.es_tipo('IDENTIFICADOR'):
+                        attr = self.avanzar()
+                        nodo_punto = NodoAST('.')
+                        nodo_punto.agregar_hijo(nodo)
+                        nodo_punto.agregar_hijo(NodoAST(attr.valor))
+                        nodo = nodo_punto
+                    else:
+                        break
+
+                # Indexacion: array[indice]
+                elif self.es_tipo('CORCHETE_ABRE'):
+                    self.avanzar()  # Consume '['
+                    nodo_idx = NodoAST('[]')
+                    nodo_idx.agregar_hijo(nodo)
+                    # Parsear el indice (puede ser : para slices)
+                    if not self.es_tipo('CORCHETE_CIERRA'):
+                        nodo_idx.agregar_hijo(self.parsear_expresion())
+                        # Slice: arr[1:3]
+                        if self.es_tipo('DOS_PUNTOS'):
+                            self.avanzar()
+                            if not self.es_tipo('CORCHETE_CIERRA'):
+                                nodo_idx.agregar_hijo(self.parsear_expresion())
+                    self.consumir_si('CORCHETE_CIERRA')
+                    nodo = nodo_idx
+
+                else:
+                    break
+
+            return nodo
+
+        # ── Expresion entre parentesis: (expr) ────────────────────────────────
         if t.tipo == 'PAREN_ABRE':
             self.avanzar()
+            # Parentesis vacio ()
+            if self.es_tipo('PAREN_CIERRA'):
+                self.avanzar()
+                return NodoAST('()')
             nodo = self.parsear_expresion()
+            # Tupla: (a, b, c)
+            if self.es_tipo('COMA'):
+                nodo_tupla = NodoAST('tupla')
+                nodo_tupla.agregar_hijo(nodo)
+                while self.es_tipo('COMA'):
+                    self.avanzar()
+                    if not self.es_tipo('PAREN_CIERRA'):
+                        nodo_tupla.agregar_hijo(self.parsear_expresion())
+                self.consumir_si('PAREN_CIERRA')
+                return nodo_tupla
             self.consumir_si('PAREN_CIERRA')
             return nodo
 
+        # ── Lista: [a, b, c] ──────────────────────────────────────────────────
+        if t.tipo == 'CORCHETE_ABRE':
+            self.avanzar()
+            nodo_lista = NodoAST('lista')
+            while not self.es_tipo('CORCHETE_CIERRA') and self.token_actual():
+                nodo_lista.agregar_hijo(self.parsear_expresion())
+                self.consumir_si('COMA')
+            self.consumir_si('CORCHETE_CIERRA')
+            return nodo_lista
+
+        # ── Negacion aritmetica: -x ────────────────────────────────────────────
         if t.tipo == 'OP_MENOS':
             self.avanzar()
             nodo_neg = NodoAST('neg')
             nodo_neg.agregar_hijo(self.parsear_primario())
             return nodo_neg
 
-        if t.tipo == 'PR_NOT':
+        # ── Not logico ────────────────────────────────────────────────────────
+        if t.tipo in ('PR_NOT', 'OP_NEGACION_BIT'):
             self.avanzar()
-            nodo_not = NodoAST('not')
+            nodo_not = NodoAST(t.valor)
             nodo_not.agregar_hijo(self.parsear_expresion())
             return nodo_not
 
-        return None
+        # ── Operadores unarios de C: ++x, --x ─────────────────────────────────
+        if t.tipo in ('OP_INCREMENTO', 'OP_DECREMENTO'):
+            self.avanzar()
+            nodo_u = NodoAST(t.valor)
+            nodo_u.agregar_hijo(self.parsear_primario())
+            return nodo_u
+
+        # ── Cualquier token no reconocido: crear nodo hoja y avanzar ──────────
+        # Esto evita el bucle infinito: en vez de retornar None y no avanzar,
+        # consumimos el token y lo representamos como hoja en el arbol.
+        self.avanzar()
+        return NodoAST(t.valor)
 
     def parsear_llamada(self, nombre):
-        """Parsea la lista de argumentos nombre(arg1, arg2, ...)"""
+        """Parsea nombre(arg1, arg2, ...) — version simple para compatibilidad."""
         nodo = NodoAST(nombre + '()')
+        self.avanzar()  # Consume '('
+        while not self.es_tipo('PAREN_CIERRA') and self.token_actual():
+            nodo.agregar_hijo(self.parsear_expresion())
+            self.consumir_si('COMA')
+        self.consumir_si('PAREN_CIERRA')
+        return nodo
+
+    def _parsear_llamada_nodo(self, nodo_func):
+        """
+        Parsea argumentos de llamada cuando ya tenemos el nodo de la funcion.
+        Usado por parsear_primario para cadenas como obj.met(args).
+        """
+        etiqueta = nodo_func.etiqueta + '()'
+        nodo = NodoAST(etiqueta)
         self.avanzar()  # Consume '('
         while not self.es_tipo('PAREN_CIERRA') and self.token_actual():
             nodo.agregar_hijo(self.parsear_expresion())
