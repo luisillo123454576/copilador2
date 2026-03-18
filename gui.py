@@ -94,6 +94,7 @@ class AplicacionCompilador:
 
         self.editor.insert('1.0', CODIGO_EJEMPLO)
         self._actualizar_lineas()
+        self._resaltar_sintaxis()
 
     # ── Estilos TTK ──────────────────────────────────────────────────────────
 
@@ -140,7 +141,7 @@ class AplicacionCompilador:
         panel.pack(fill='both', expand=True, padx=10, pady=10)
 
         # Panel izquierdo: editor
-        izq = tk.Frame(panel, bg=C['bg_panel'], width=480)
+        izq = tk.Frame(panel, bg=C['bg_panel'], width=580)
         izq.pack(side='left', fill='both', padx=(0, 5))
         izq.pack_propagate(False)
         self._crear_editor(izq)
@@ -181,7 +182,16 @@ class AplicacionCompilador:
 
         for evento in ('<KeyRelease>', '<MouseWheel>', '<Button-1>'):
             self.editor.bind(evento, self._actualizar_lineas)
+        self.editor.bind('<KeyRelease>', self._resaltar_sintaxis)
 
+        # Tags de color del editor (mismos colores que la tabla)
+        self.editor.tag_config('pr',  foreground='#A6E3A1')
+        self.editor.tag_config('op',  foreground='#FAB387')
+        self.editor.tag_config('num', foreground='#CBA6F7')
+        self.editor.tag_config('id',  foreground='#89DCEB')
+        self.editor.tag_config('str', foreground='#F38BA8')
+        self.editor.tag_config('com', foreground='#6C7086')
+        self.editor.tag_config('del', foreground='#CDD6F4')
         # Botones de accion
         self._crear_botones(padre)
 
@@ -233,7 +243,24 @@ class AplicacionCompilador:
                     font=(FUENTE_CODIGO[0], FUENTE_CODIGO[1] - 1),
                     fill=C['texto_dim'], anchor='ne'
                 )
+    def _resaltar_sintaxis(self, event=None):
+        # Borrar todos los colores anteriores
+        for tag in ('pr', 'op', 'num', 'id', 'str', 'com', 'del'):
+            self.editor.tag_remove(tag, '1.0', 'end')
 
+        codigo = self.editor.get('1.0', 'end-1c')
+        if not codigo.strip():
+            return
+
+        # Tokenizar con el mismo lexer del proyecto
+        tokens, _ = self.lexer.analizar(codigo)
+
+        for token in tokens:
+            # Tkinter usa "linea.columna" donde columna empieza en 0
+            inicio = '%d.%d' % (token.linea, token.columna - 1)
+            fin    = '%d.%d' % (token.linea, token.columna - 1 + len(token.valor))
+            tag = self._tag(token.categoria, token.tipo)
+            self.editor.tag_add(tag, inicio, fin)
     # ── Panel de resultados ───────────────────────────────────────────────────
 
     def _crear_resultados(self, padre):
